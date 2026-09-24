@@ -1,8 +1,24 @@
-# 配送任务拖拽排班
+# 装卸月台看板
 
 - 行业：物流
-- 技术栈：React、Vite、TypeScript、Ant Design、dnd-kit
+- 技术栈：React、Vite、TypeScript、dnd-kit
 - 启动：`npm install && npm run dev`
 - 构建：`npm run build`
 
-这是一个功能最小闭环前端项目，数据默认保存在浏览器localStorage中，方便后续扩展接口、权限、图表或地图能力。
+仓库装卸月台的调度看板：车辆预约（承运商、到车时间、货温、预计占用分钟）从待排区拖入月台，数据保存在浏览器 localStorage。
+
+## 排入规则
+
+- 同一月台前后两车至少间隔 10 分钟
+- 冷链车（冷藏/冷冻）不能进常温口，月台只承接其标注的货温
+- 预计占用结束时间超过月台下一次检修开始时间的不放行
+- 被挡车辆回到待排区，并列出未通过的条件
+- 车辆到达后锁定月台；改口需登记原因和实际到车时间，原时段立即释放
+- 已完成车辆只保留在历史记录中
+
+## 目录结构（资料、规则、页面分开维护）
+
+- `src/data/docks.ts` — 月台资料：可接货温、下一次检修时间
+- `src/data/rules.ts` — 预约规则：最小间隔、货温约束、检修校验
+- `src/data/seed.ts` / `src/data/storage.ts` — 初始数据与本地持久化
+- `src/App.tsx` + `src/components/` — 看板页面

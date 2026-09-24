@@ -1,289 +1,238 @@
-import { FormEvent, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import { DndContext, DragEndEvent, PointerSensor, useSensor, useSensors } from "@dnd-kit/core";
+import { useDroppable } from "@dnd-kit/core";
+import type { Vehicle } from "./types";
+import { DOCKS } from "./data/docks";
+import { BOOKING_RULES, checkAssignment, fmtTime, type RuleFailure } from "./data/rules";
+import { loadVehicles, saveVehicles } from "./data/storage";
+import AppointmentForm from "./components/AppointmentForm";
+import DockLane from "./components/DockLane";
+import VehicleCard from "./components/VehicleCard";
+import ReassignModal from "./components/ReassignModal";
+import HistoryPanel from "./components/HistoryPanel";
 
-type Field = {
-  key: string;
-  label: string;
-  type?: "number" | "date" | "select";
-  options?: string[];
-};
+const POOL_ID = "pool";
 
-type RecordItem = {
-  id: string;
-  status: string;
-  notes: string;
-  createdAt: string;
-  [key: string]: string | number;
-};
-
-const project = {
-  "number": 14,
-  "folder": "hxwl/frontend/hxwlfront-14",
-  "framework": "react",
-  "title": "配送任务拖拽排班",
-  "subtitle": "把待分配订单安排给司机，并统计任务数和总重量。",
-  "industry": "物流",
-  "stack": [
-    "React",
-    "Vite",
-    "TypeScript",
-    "Ant Design",
-    "dnd-kit"
-  ],
-  "storageKey": "hxwlfront-14-schedule",
-  "formTitle": "新增待分配订单",
-  "primaryAction": "加入待分配",
-  "entityLabel": "订单",
-  "statuses": [
-    "待分配",
-    "已分配",
-    "已完成"
-  ],
-  "filters": [
-    "全部司机",
-    "刘师傅",
-    "赵师傅",
-    "孙师傅"
-  ],
-  "fields": [
-    {
-      "key": "orderNo",
-      "label": "订单号"
-    },
-    {
-      "key": "driver",
-      "label": "司机",
-      "type": "select",
-      "options": [
-        "刘师傅",
-        "赵师傅",
-        "孙师傅"
-      ]
-    },
-    {
-      "key": "weight",
-      "label": "重量kg",
-      "type": "number"
-    },
-    {
-      "key": "destination",
-      "label": "目的地"
-    }
-  ],
-  "records": [
-    {
-      "orderNo": "ORD-9012",
-      "driver": "刘师傅",
-      "weight": 260,
-      "destination": "浦东",
-      "status": "已分配",
-      "notes": "上午配送"
-    },
-    {
-      "orderNo": "ORD-9031",
-      "driver": "赵师傅",
-      "weight": 140,
-      "destination": "嘉定",
-      "status": "待分配",
-      "notes": "待排班"
-    }
-  ],
-  "metricLabels": [
-    "订单数",
-    "已分配",
-    "总重量"
-  ]
-} as const;
-
-const fields = project.fields as unknown as Field[];
-const statuses: string[] = [...project.statuses];
-
-function createBlank() {
-  return Object.fromEntries(fields.map((field) => [field.key, field.type === "number" ? 0 : ""]));
+interface Rejection {
+  dockName: string;
+  failures: RuleFailure[];
+  at: string;
 }
 
-function loadRecords(): RecordItem[] {
-  const raw = localStorage.getItem(project.storageKey);
-  if (!raw) {
-    return project.records.map((record, index) => ({
-      ...record,
-      id: `seed-${index + 1}`,
-      createdAt: new Date(Date.now() - index * 86400000).toISOString()
-    })) as RecordItem[];
-  }
-  try {
-    return JSON.parse(raw) as RecordItem[];
-  } catch {
-    return [];
-  }
+function nowEvent(type: Vehicle["events"][number]["type"], detail: string) {
+  return { at: new Date().toISOString(), type, detail };
 }
 
-function saveRecords(records: RecordItem[]) {
-  localStorage.setItem(project.storageKey, JSON.stringify(records));
-}
-
-function nextStatus(status: string) {
-  const index = statuses.indexOf(status);
-  return statuses[(index + 1) % statuses.length];
-}
-
-function primaryText(record: RecordItem) {
-  const first = fields[0];
-  const second = fields[1];
-  return [record[first.key], record[second.key]].filter(Boolean).join(" / ") || project.entityLabel;
+/** 待排区（可拖回） */
+function Pool({ vehicles, rejections, onRemove }: {
+  vehicles: Vehicle[];
+  rejections: Record<string, RuleFailure[]>;
+  onRemove: (v: Vehicle) => void;
+}) {
+  const { setNodeRef, isOver } = useDroppable({ id: POOL_ID });
+  const sorted = [...vehicles].sort((a, b) => a.arrivalAt.localeCompare(b.arrivalAt));
+  return (
+    <section ref={setNodeRef} className={`pool ${isOver ? "drop-target" : ""}`}>
+      <h2>待排区（{sorted.length}）</h2>
+      <p className="pool-hint">把车辆拖到右侧月台；同月台前后车至少留 {BOOKING_RULES.minGapMinutes} 分钟</p>
+      <div className="pool-list">
+        {sorted.length === 0 && <div className="empty">待排区已清空</div>}
+        {sorted.map((v) => (
+          <VehicleCard key={v.id} vehicle={v} rejection={rejections[v.id]} onRemove={onRemove} />
+        ))}
+      </div>
+    </section>
+  );
 }
 
 export default function App() {
-  const [records, setRecords] = useState<RecordItem[]>(loadRecords);
-  const [form, setForm] = useState<Record<string, string | number>>(createBlank);
-  const [note, setNote] = useState("");
-  const [filter, setFilter] = useState<string>(project.filters[0]);
+  const [vehicles, setVehicles] = useState<Vehicle[]>(loadVehicles);
+  const [rejections, setRejections] = useState<Record<string, RuleFailure[]>>({});
+  const [banner, setBanner] = useState<{ plate: string; rejection: Rejection } | null>(null);
+  const [reassigning, setReassigning] = useState<Vehicle | null>(null);
 
-  const filteredRecords = useMemo(() => {
-    if (filter.startsWith("全部")) return records;
-    return records.filter((record) => Object.values(record).includes(filter));
-  }, [filter, records]);
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 5 } }));
+
+  function update(next: Vehicle[]) {
+    setVehicles(next);
+    saveVehicles(next);
+  }
+
+  function patchVehicle(id: string, patch: Partial<Vehicle>, event?: Vehicle["events"][number]) {
+    update(
+      vehicles.map((v) =>
+        v.id === id ? { ...v, ...patch, events: event ? [...v.events, event] : v.events } : v
+      )
+    );
+  }
+
+  /** 该月台上仍占用时段的车辆（已排 + 已到达） */
+  function dockActiveVehicles(dockId: string, excludeId?: string) {
+    return vehicles.filter(
+      (v) => v.dockId === dockId && v.id !== excludeId && (v.status === "已排" || v.status === "已到达")
+    );
+  }
+
+  function attemptAssign(vehicle: Vehicle, dockId: string) {
+    const dock = DOCKS.find((d) => d.id === dockId);
+    if (!dock) return;
+    const failures = checkAssignment(vehicle, dock, dockActiveVehicles(dockId, vehicle.id));
+    if (failures.length > 0) {
+      // 被挡：回到待排区，并指出未通过的条件
+      setRejections((prev) => ({ ...prev, [vehicle.id]: failures }));
+      setBanner({ plate: vehicle.plate, rejection: { dockName: dock.name, failures, at: new Date().toISOString() } });
+      if (vehicle.dockId !== null || vehicle.status !== "待排") {
+        patchVehicle(vehicle.id, { dockId: null, status: "待排" }, nowEvent("退回", `排入 ${dock.name} 被挡：${failures.map((f) => f.message).join("；")}`));
+      }
+      return;
+    }
+    setRejections((prev) => {
+      const next = { ...prev };
+      delete next[vehicle.id];
+      return next;
+    });
+    setBanner(null);
+    const from = DOCKS.find((d) => d.id === vehicle.dockId)?.name;
+    patchVehicle(
+      vehicle.id,
+      { dockId, status: "已排" },
+      nowEvent("排入", from && from !== dock.name ? `由 ${from} 改排至 ${dock.name}` : `排入 ${dock.name}`)
+    );
+  }
+
+  function handleDragEnd(event: DragEndEvent) {
+    const vehicle = vehicles.find((v) => v.id === event.active.id);
+    if (!vehicle || !event.over) return;
+    if (event.over.id === POOL_ID) {
+      if (vehicle.status === "已排") {
+        patchVehicle(vehicle.id, { dockId: null, status: "待排" }, nowEvent("退回", "调度退回待排区"));
+      }
+      return;
+    }
+    attemptAssign(vehicle, String(event.over.id));
+  }
+
+  function handleArrive(vehicle: Vehicle) {
+    const dockName = DOCKS.find((d) => d.id === vehicle.dockId)?.name ?? "";
+    patchVehicle(
+      vehicle.id,
+      { status: "已到达", actualArrivalAt: new Date().toISOString() },
+      nowEvent("到达", `车辆到达 ${dockName}，月台锁定`)
+    );
+  }
+
+  function handleReassignConfirm(dockId: string, reason: string, actualArrivalAt: string) {
+    if (!reassigning) return;
+    const from = DOCKS.find((d) => d.id === reassigning.dockId)?.name ?? "原月台";
+    const to = DOCKS.find((d) => d.id === dockId)?.name ?? dockId;
+    patchVehicle(
+      reassigning.id,
+      { dockId, actualArrivalAt },
+      nowEvent("改口", `由 ${from} 改至 ${to}，原时段已释放；原因：${reason}；实际到车 ${fmtTime(actualArrivalAt)}`)
+    );
+    setReassigning(null);
+  }
+
+  function handleComplete(vehicle: Vehicle) {
+    const dockName = DOCKS.find((d) => d.id === vehicle.dockId)?.name ?? "";
+    patchVehicle(vehicle.id, { status: "已完成" }, nowEvent("完成", `装卸完成，${dockName} 释放`));
+  }
 
   const metrics = useMemo(() => {
-    const total = records.length;
-    const second = records.filter((record) => record.status === statuses[1]).length;
-    const third = records.filter((record) => record.status === statuses[2]).length;
-    const numberValues = records.flatMap((record) =>
-      fields.filter((field) => field.type === "number").map((field) => Number(record[field.key] || 0))
-    );
-    const sum = numberValues.reduce((acc, value) => acc + value, 0);
-    return [total, second || sum, third || Math.round(sum / Math.max(total, 1))];
-  }, [records]);
+    const pending = vehicles.filter((v) => v.status === "待排").length;
+    const scheduled = vehicles.filter((v) => v.status === "已排").length;
+    const lockedDocks = new Set(vehicles.filter((v) => v.status === "已到达").map((v) => v.dockId)).size;
+    const done = vehicles.filter((v) => v.status === "已完成").length;
+    return [
+      { label: "待排车辆", value: pending },
+      { label: "已排待到达", value: scheduled },
+      { label: "锁定月台", value: lockedDocks },
+      { label: "已完成车次", value: done },
+    ];
+  }, [vehicles]);
 
-  const chartRows = statuses.map((status) => ({
-    status,
-    value: records.filter((record) => record.status === status).length
-  }));
-  const maxChart = Math.max(1, ...chartRows.map((row) => row.value));
-
-  function updateRecords(next: RecordItem[]) {
-    setRecords(next);
-    saveRecords(next);
-  }
-
-  function handleSubmit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    const next: RecordItem = {
-      ...form,
-      id: crypto.randomUUID(),
-      status: statuses[0],
-      notes: note || "暂无备注",
-      createdAt: new Date().toISOString()
-    } as RecordItem;
-    updateRecords([next, ...records]);
-    setForm(createBlank());
-    setNote("");
-  }
+  const poolVehicles = vehicles.filter((v) => v.status === "待排");
 
   return (
     <main className="app">
-      <div className="shell">
+      <div className="shell wide">
         <header className="topbar">
           <div>
-            <p className="eyebrow">{project.industry}行业前端最小闭环</p>
-            <h1>{project.title}</h1>
-            <p className="subtitle">{project.subtitle}</p>
+            <p className="eyebrow">物流行业前端最小闭环</p>
+            <h1>装卸月台看板</h1>
+            <p className="subtitle">
+              车辆预约排入月台：同月台前后车至少留 {BOOKING_RULES.minGapMinutes} 分钟，冷链车不能进常温口，超过检修开始时间不放行。
+            </p>
           </div>
-          <div className="stack">{project.stack.map((item) => <span className="tag" key={item}>{item}</span>)}</div>
+          <div className="stack">
+            {["React", "Vite", "TypeScript", "dnd-kit"].map((item) => (
+              <span className="tag" key={item}>{item}</span>
+            ))}
+          </div>
         </header>
 
-        <section className="metrics">
-          {project.metricLabels.map((label, index) => (
-            <article className="metric" key={label}>
-              <span>{label}</span>
-              <strong>{metrics[index]}</strong>
+        <section className="metrics four">
+          {metrics.map((m) => (
+            <article className="metric" key={m.label}>
+              <span>{m.label}</span>
+              <strong>{m.value}</strong>
             </article>
           ))}
         </section>
 
-        <section className="workspace">
-          <form className="panel" onSubmit={handleSubmit}>
-            <h2>{project.formTitle}</h2>
-            <div className="form-grid">
-              {fields.map((field) => (
-                <label key={field.key}>
-                  {field.label}
-                  {field.type === "select" ? (
-                    <select
-                      value={String(form[field.key])}
-                      onChange={(event) => setForm({ ...form, [field.key]: event.target.value })}
-                      required
-                    >
-                      <option value="">请选择</option>
-                      {field.options?.map((option) => <option key={option}>{option}</option>)}
-                    </select>
-                  ) : (
-                    <input
-                      type={field.type || "text"}
-                      value={form[field.key]}
-                      onChange={(event) =>
-                        setForm({ ...form, [field.key]: field.type === "number" ? Number(event.target.value) : event.target.value })
-                      }
-                      required
-                    />
-                  )}
-                </label>
-              ))}
-              <label>
-                备注
-                <textarea value={note} onChange={(event) => setNote(event.target.value)} placeholder="填写处理说明或现场备注" />
-              </label>
-              <button type="submit">{project.primaryAction}</button>
+        {banner && (
+          <div className="block-banner">
+            <div>
+              <strong>⛔ {banner.plate} 未能排入 {banner.rejection.dockName}，已回到待排区：</strong>
+              <ul>
+                {banner.rejection.failures.map((f, i) => (
+                  <li key={i}>{f.message}</li>
+                ))}
+              </ul>
             </div>
-          </form>
+            <button className="secondary" type="button" onClick={() => setBanner(null)}>知道了</button>
+          </div>
+        )}
 
-          <section className="list-panel">
-            <div className="toolbar">
-              <h2>{project.entityLabel}列表</h2>
-              <select value={filter} onChange={(event) => setFilter(event.target.value)}>
-                {project.filters.map((item) => <option key={item}>{item}</option>)}
-              </select>
-            </div>
-
-            <div className="record-grid">
-              {filteredRecords.length === 0 ? <div className="empty">暂无匹配数据</div> : filteredRecords.map((record) => (
-                <article className="record" key={record.id}>
-                  <div className="record-head">
-                    <p className="record-title">{primaryText(record)}</p>
-                    <span className="status">{record.status}</span>
-                  </div>
-                  <div className="details">
-                    {fields.map((field) => (
-                      <span key={field.key}>{field.label}: {record[field.key]}</span>
-                    ))}
-                  </div>
-                  <p className="note">{record.notes}</p>
-                  <div className="actions">
-                    <button type="button" onClick={() => updateRecords(records.map((item) => item.id === record.id ? { ...item, status: nextStatus(item.status) } : item))}>
-                      流转状态
-                    </button>
-                    <button className="secondary" type="button" onClick={() => navigator.clipboard?.writeText(primaryText(record))}>
-                      复制摘要
-                    </button>
-                    <button className="danger" type="button" onClick={() => updateRecords(records.filter((item) => item.id !== record.id))}>
-                      删除
-                    </button>
-                  </div>
-                </article>
-              ))}
-            </div>
-
-            <div className="mini-chart">
-              {chartRows.map((row) => (
-                <div className="bar" key={row.status}>
-                  <span>{row.status}</span>
-                  <div className="bar-track"><div className="bar-fill" style={{ width: `${(row.value / maxChart) * 100}%` }} /></div>
-                  <strong>{row.value}</strong>
-                </div>
+        <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+          <section className="board">
+            <aside className="side">
+              <AppointmentForm onAdd={(v) => update([v, ...vehicles])} />
+              <Pool vehicles={poolVehicles} rejections={rejections} onRemove={(v) => update(vehicles.filter((x) => x.id !== v.id))} />
+            </aside>
+            <div className="lanes">
+              {DOCKS.map((dock) => (
+                <DockLane
+                  key={dock.id}
+                  dock={dock}
+                  vehicles={vehicles.filter((v) => v.dockId === dock.id && (v.status === "已排" || v.status === "已到达"))}
+                  rejections={rejections}
+                  onArrive={handleArrive}
+                  onSendBack={(v) => patchVehicle(v.id, { dockId: null, status: "待排" }, nowEvent("退回", "调度退回待排区"))}
+                  onReassign={setReassigning}
+                  onComplete={handleComplete}
+                />
               ))}
             </div>
           </section>
-        </section>
+        </DndContext>
+
+        <HistoryPanel
+          vehicles={vehicles}
+          docks={DOCKS}
+          onClear={() => update(vehicles.filter((v) => v.status !== "已完成"))}
+        />
       </div>
+
+      {reassigning && (
+        <ReassignModal
+          vehicle={reassigning}
+          docks={DOCKS}
+          vehicles={vehicles}
+          onClose={() => setReassigning(null)}
+          onConfirm={handleReassignConfirm}
+        />
+      )}
     </main>
   );
 }
